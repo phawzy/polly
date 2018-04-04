@@ -47,12 +47,8 @@ func main() {
 		} else {
 			println(response.Polls)
 		}
-
 	} else {
-		response, _ := client.AddPoll(ctx, &pb.Poll{PollName: *pollName})
-		if response.Done {
-			println("done")
-		}
+		println("wrong options")
 	}
 
 }
