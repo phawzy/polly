@@ -23,54 +23,23 @@ var (
 	port = flag.Int("port", 10000, "The server port")
 )
 
-type Poll struct {
-	up   int
-	down int
+type DB struct {
+	dbDriver *sql.DB
 }
 
-var db = sql.DB{}
-var polls = map[string]Poll{}
-
-//PollyServer struct for server
-type pollyServer struct{}
-
-//AddPoll add poll
-func (grpcServer *pollyServer) AddPoll(ctx context.Context, in *pb.Poll) (*pb.Response, error) {
-	_, noError := polls[in.PollName]
-	if !noError {
-		polls[in.PollName] = Poll{up: 0, down: 0}
-		return &pb.Response{Done: true}, nil
-	}
-	return &pb.Response{Done: false}, errors.New("poll already exists")
-
+func CreateDBInstance() *sql.DB {
+	mydb, err := sql.Open("sqlite3", "./polls.db")
+	checkErr(err)
+	return mydb
 }
 
-func (grpcServer *pollyServer) UpdatePoll(ctx context.Context, in *pb.UpdatePoll) (*pb.Response, error) {
-	currentPoll, noError := polls[in.PollName]
-	if !noError {
-		return &pb.Response{Done: false}, errors.New("poll doesn't exists")
-	}
-	up := currentPoll.up
-	if in.PollAction == "up" {
-		up = up + 1
-	}
-	down := currentPoll.down
-	if in.PollAction == "down" {
-		down = down + 1
-	}
+var dbInstance *DB
 
-	polls[in.PollName] = Poll{up: up, down: down}
-	println("updated : " + in.PollAction + " on poll " + in.PollName)
-	return &pb.Response{Done: true}, nil
-}
-
-func (grpcServer *pollyServer) ListPolls(ctx context.Context, in *pb.Empty) (*pb.Polls, error) {
-	pollsList := []string{}
-	for pollname, pollVotes := range polls {
-		println(pollname)
-		pollsList = append(pollsList, pollname+"{up: "+strconv.Itoa(pollVotes.up)+", down: "+strconv.Itoa(pollVotes.down)+"}")
+func GetDBInstance() *DB {
+	if dbInstance == nil {
+		dbInstance = &DB{dbDriver: CreateDBInstance()} // <--- NOT THREAD SAFE
 	}
-	return &pb.Polls{Polls: strings.Join(pollsList[:], ",")}, nil
+	return dbInstance
 }
 
 func checkErr(err error) {
@@ -79,47 +48,68 @@ func checkErr(err error) {
 	}
 }
 
-func main() {
+//PollyServer struct for server
+type pollyServer struct{}
 
-	db, err := sql.Open("sqlite3", "./polls.db")
-	checkErr(err)
-
-	sqlStmt := `
-	create table IF NOT EXISTS polls (pollName text not null primary key, upvotes integer, downvotes integer);
-	delete from polls;
-	`
-	_, err = db.Exec(sqlStmt)
-	if err != nil {
-		log.Printf("%q: %s\n", err, sqlStmt)
-		return
-	}
-
-	if err != nil {
-		log.Fatal(err)
-	}
+//AddPoll add poll
+func (grpcServer *pollyServer) AddPoll(ctx context.Context, in *pb.Poll) (*pb.Response, error) {
+	var db = GetDBInstance().dbDriver
+	println(in.PollName)
 
 	// insert
 	addPoll, err := db.Prepare("INSERT INTO polls(pollName, upvotes, downvotes) values(?,?,?)")
-	checkErr(err)
-	res, err := addPoll.Exec("hell", 0, 0)
-	checkErr(err)
-	id, err := res.LastInsertId()
-	checkErr(err)
+	if err != nil {
+		checkErr(errors.New("fuck"))
+	}
 
-	fmt.Println(id)
+	_, err = addPoll.Exec(in.PollName, 0, 0)
 
-	upvotePoll, err := db.Prepare("update polls set upvotes=? where pollName=?")
+	if err != nil {
+		return &pb.Response{Done: false}, errors.New("poll already exists")
+	}
+	return &pb.Response{Done: true}, nil
+
+}
+
+func (grpcServer *pollyServer) UpdatePoll(ctx context.Context, in *pb.UpdatePoll) (*pb.Response, error) {
+	var db = GetDBInstance().dbDriver
+
+	rows, err := db.Query("SELECT pollName, upvotes, downvotes FROM polls where pollName='" + in.PollName + "'")
 	checkErr(err)
+	var pollName string
+	var upvotes int
+	var downvotes int
+	if rows.Next() {
+		err = rows.Scan(&pollName, &upvotes, &downvotes)
+		checkErr(err)
+	} else {
+		return &pb.Response{Done: false}, errors.New("poll doesn't exists")
+	}
+	rows.Close()
 
-	res, err = upvotePoll.Exec(1, "hell")
-	checkErr(err)
+	if in.PollAction == "up" {
+		upvotes = upvotes + 1
+		upvotePoll, err := db.Prepare("update polls set upvotes=? where pollName=?")
+		checkErr(err)
 
-	downvotePoll, err := db.Prepare("update polls set downvotes=? where pollName=?")
-	checkErr(err)
+		_, err = upvotePoll.Exec(upvotes, in.PollName)
+		checkErr(err)
+	}
+	if in.PollAction == "down" {
+		downvotes = downvotes + 1
+		downvotePoll, err := db.Prepare("update polls set downvotes=? where pollName=?")
+		checkErr(err)
 
-	res, err = downvotePoll.Exec(1, "hell")
-	checkErr(err)
+		_, err = downvotePoll.Exec(downvotes, in.PollName)
+		checkErr(err)
+	}
+	println("updated : " + in.PollAction + " on poll " + in.PollName)
+	return &pb.Response{Done: true}, nil
+}
 
+func (grpcServer *pollyServer) ListPolls(ctx context.Context, in *pb.Empty) (*pb.Polls, error) {
+	pollsList := []string{}
+	var db = GetDBInstance().dbDriver
 	rows, err := db.Query("SELECT pollName, upvotes, downvotes FROM polls")
 	checkErr(err)
 	var pollName string
@@ -129,12 +119,30 @@ func main() {
 	for rows.Next() {
 		err = rows.Scan(&pollName, &upvotes, &downvotes)
 		checkErr(err)
-		fmt.Println(pollName)
-		fmt.Println(upvotes)
-		fmt.Println(downvotes)
+		println(pollName)
+		pollsList = append(pollsList, pollName+"{up: "+strconv.Itoa(upvotes)+", down: "+strconv.Itoa(downvotes)+"}")
 	}
 
 	rows.Close() //good habit to close
+	return &pb.Polls{Polls: strings.Join(pollsList[:], ",")}, nil
+}
+
+func main() {
+
+	var db = GetDBInstance().dbDriver
+	defer db.Close()
+	sqlStmt := `
+	create table IF NOT EXISTS polls (pollName text not null primary key, upvotes integer, downvotes integer);
+	`
+	_, err := db.Exec(sqlStmt)
+	if err != nil {
+		log.Printf("%q: %s\n", err, sqlStmt)
+		return
+	}
+
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	flag.Parse()
 	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
